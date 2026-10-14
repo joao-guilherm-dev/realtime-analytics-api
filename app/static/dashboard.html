@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Realtime Analytics</title>
+<style>
+:root{--bg:#0b0f14;--panel:#121820;--line:#1f2a37;--fg:#d6e2f0;--mut:#7d8ea3;--ok:#3ddc97;--bad:#ff5d73;--acc:#4cc9f0}
+@media (prefers-color-scheme: light){:root{--bg:#f4f6f9;--panel:#fff;--line:#d9e0e8;--fg:#17202b;--mut:#5b6b7e;--ok:#0f9d6b;--bad:#d62f48;--acc:#1280b3}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px ui-monospace,Consolas,monospace}
+header{display:flex;gap:12px;align-items:center;padding:12px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+h1{font-size:15px;margin:0;color:var(--acc)}
+input,select,button{background:var(--panel);color:var(--fg);border:1px solid var(--line);padding:6px 10px;border-radius:6px;font:inherit}
+button{cursor:pointer}button:hover{border-color:var(--acc)}
+main{display:grid;grid-template-columns:2fr 1fr;gap:12px;padding:12px;max-width:1200px;margin:auto}
+@media(max-width:800px){main{grid-template-columns:1fr}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px}
+canvas{width:100%;height:260px;display:block}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
+.k{color:var(--mut);font-size:12px}.v{font-size:18px}
+#feed{max-height:260px;overflow:auto;font-size:12px}#feed div{padding:4px 0;border-bottom:1px solid var(--line)}
+.bad{color:var(--bad)}.ok{color:var(--ok)}
+</style>
+</head>
+<body>
+<header>
+  <h1>&gt;_ realtime-analytics</h1>
+  <input id="u" placeholder="usuário" size="10"><input id="p" type="password" placeholder="senha" size="10">
+  <button id="login">Entrar</button><button id="reg">Criar conta</button>
+  <select id="m"></select><button id="conn">Conectar</button>
+  <span id="st" class="k">desconectado</span>
+</header>
+<main>
+  <section class="card"><canvas id="c"></canvas></section>
+  <section class="card"><div class="grid" id="stats"></div></section>
+  <section class="card" style="grid-column:1/-1"><div class="k">alertas e anomalias</div><div id="feed"></div></section>
+</main>
+<script>
+const $=s=>document.querySelector(s);let token=null,ws=null,pts=[];const MAX=120;
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n);
+const api=(path,opt={})=>fetch('/api/v1'+path,{...opt,headers:{'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{})}});
+async function auth(kind){
+  const r=await api('/auth/'+kind,{method:'POST',body:JSON.stringify({username:$('#u').value,password:$('#p').value})});
+  const j=await r.json();
+  if(kind==='register'){ $('#st').textContent=r.ok?'conta criada, clique Entrar':(j.detail&&j.detail[0]?j.detail[0].msg:j.detail);return}
+  if(!r.ok){$('#st').textContent=j.detail;return}
+  token=j.access_token;$('#st').textContent='autenticado';loadMetrics();
+}
+async function loadMetrics(){
+  const j=await (await api('/metrics')).json();
+  $('#m').innerHTML=j.metrics.map(m=>`<option>${m.metric}</option>`).join('')||'<option>(sem métricas)</option>';
+}
+function connect(){
+  if(!token)return;if(ws)ws.close();
+  const m=$('#m').value;
+  ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws/metrics/${m}?token=${token}`);
+  ws.onopen=()=>$('#st').textContent='ao vivo: '+m;
+  ws.onclose=()=>$('#st').textContent='desconectado';
+  ws.onmessage=e=>{const d=JSON.parse(e.data);
+    if(d.type==='snapshot'){pts=d.series.map(([t,v])=>({t,v,a:false}));showStats(d.stats)}
+    else if(d.type==='point'){pts.push({t:d.ts,v:d.value,a:d.anomaly});if(pts.length>MAX)pts.shift();
+      if(d.anomaly)log(`anomalia ${d.metric}=${d.value} (score ${d.score})`,true);showLive(d)}
+    else if(d.type==='alert')log('ALERTA '+d.message,true);
+    draw()};
+}
+function log(t,bad){const f=$('#feed');const x=document.createElement('div');x.className=bad?'bad':'ok';
+  x.textContent=new Date().toLocaleTimeString()+'  '+t;f.prepend(x)}
+function cell(k,v){return `<div><div class="k">${k}</div><div class="v">${v}</div></div>`}
+const f=n=>n==null?'-':(+n).toFixed(2);
+function showStats(s){if(!s.count)return;$('#stats').innerHTML=cell('média',f(s.mean))+cell('desvio',f(s.std))+cell('min',f(s.min))+cell('max',f(s.max))+cell('p95',f(s.p95))+cell('pontos',s.count)}
+function showLive(d){$('#stats').innerHTML=cell('último',f(d.value))+cell('média (janela)',f(d.window.mean))+cell('desvio',f(d.window.std))+cell('score z',f(d.score))+cell('anomalia',d.anomaly?'<span class=bad>SIM</span>':'não')+cell('pontos',pts.length)}
+function draw(){
+  const c=$('#c'),r=devicePixelRatio||1;c.width=c.clientWidth*r;c.height=c.clientHeight*r;
+  const g=c.getContext('2d');g.scale(r,r);const W=c.clientWidth,H=c.clientHeight;g.clearRect(0,0,W,H);
+  if(pts.length<2)return;
+  const vs=pts.map(p=>p.v),lo=Math.min(...vs),hi=Math.max(...vs),pad=(hi-lo||1)*.1;
+  const x=i=>10+i*(W-20)/(pts.length-1),y=v=>H-10-(v-(lo-pad))/((hi-lo)+2*pad)*(H-20);
+  g.strokeStyle=css('--line');g.lineWidth=1;for(let i=0;i<5;i++){g.beginPath();g.moveTo(0,10+i*(H-20)/4);g.lineTo(W,10+i*(H-20)/4);g.stroke()}
+  g.strokeStyle=css('--acc');g.lineWidth=2;g.beginPath();pts.forEach((p,i)=>i?g.lineTo(x(i),y(p.v)):g.moveTo(x(i),y(p.v)));g.stroke();
+  g.fillStyle=css('--bad');pts.forEach((p,i)=>{if(p.a){g.beginPath();g.arc(x(i),y(p.v),5,0,7);g.fill()}});
+  g.fillStyle=css('--mut');g.fillText(f(hi),4,12);g.fillText(f(lo),4,H-2);
+}
+$('#login').onclick=()=>auth('login');$('#reg').onclick=()=>auth('register');$('#conn').onclick=connect;
+$('#m').onfocus=()=>token&&loadMetrics();addEventListener('resize',draw);
+</script>
+</body>
+</html>
